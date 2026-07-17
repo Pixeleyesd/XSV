@@ -6,7 +6,7 @@ CFLAGS ?= -Wall -Wextra -O2
 LDLIBS := -lX11 -lXcomposite -lXdamage -lXfixes -lXext
 
 BIN := xsv-capture-poc
-SRC := src/main.c
+SRC := src/main.c src/capture.c
 
 $(BIN): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDLIBS)

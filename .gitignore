@@ -2,6 +2,10 @@
 server/capture/xsv-capture-poc
 *.o
 
+# capture output, generated at runtime, not source
+*.ppm
+latest.png
+
 # editor/OS noise
 .vscode/
 *.swp

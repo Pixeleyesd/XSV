@@ -1,5 +1,5 @@
 /*
- * xsv-capture-poc — step 0 of the whole project.
+ * xsv-capture-poc, step 0 of the whole project.
  *
  * does exactly one thing: redirect a single window off-screen with
  * XComposite, watch it with XDamage, and print out damage rects as they
@@ -21,6 +21,8 @@
 #include <X11/extensions/Xdamage.h>
 #include <X11/extensions/Xfixes.h>
 
+#include "../include/capture.h"
+
 /* not shart, shard. every time. we get it. */
 static volatile sig_atomic_t keep_running = 1;
 
@@ -36,7 +38,7 @@ int main(int argc, char **argv) {
     }
 
     /* redirected to a file when we background this thing, which means
-       fully-buffered stdio by default — line-buffer it so the log is
+       fully-buffered stdio by default, so we line-buffer it so the log is
        actually readable while it's still running, not just after exit. */
     setvbuf(stdout, NULL, _IOLBF, 0);
 
@@ -101,7 +103,7 @@ int main(int argc, char **argv) {
            this is not optional: xlib can silently buffer events internally
            as a side effect of an earlier synchronous round-trip (in our
            case, the XGetWindowAttributes call above), and those events
-           will never show up as fresh readability on the socket — select()
+           will never show up as fresh readability on the socket, so select()
            has nothing to report because xlib already read the bytes off
            the wire before we ever got here. gating this drain behind
            select()'s return value (the obvious-looking way to write this
@@ -121,14 +123,26 @@ int main(int argc, char **argv) {
 
                 /* ack it or the server stops sending new ones for this
                    damage object. XDamageSubtract with None,None just
-                   clears the whole accumulated region — fine for a poc
+                   clears the whole accumulated region, which is fine for a poc
                    that isn't tracking sub-regions yet. */
                 XDamageSubtract(dpy, damage, None, None);
+
+                /* this is the actual point of adding capture.c: pull the
+                   real pixels out, not just the notification that they
+                   changed. overwrites the same file each time so you can
+                   just keep opening it and see the current contents. */
+                xsv_frame frame;
+                if (xsv_capture_window(dpy, target, &frame) == 0) {
+                    xsv_save_ppm(&frame, "latest.ppm");
+                    xsv_free_frame(&frame);
+                } else {
+                    fprintf(stderr, "capture failed on damage #%ld\n", damage_count);
+                }
             }
         }
 
         /* now block efficiently until there's *probably* more to do.
-           we don't trust or even check the return value — right or
+           we don't trust or even check the return value, right or
            wrong, we're going straight back to draining XPending at the
            top of the loop regardless, which is what actually matters. */
         fd_set fds;

@@ -1,204 +1,195 @@
-# XSV — X Shard Viewer
+# XSV Architecture
 
-a hybrid remote desktop system. each window (or region of a window) is forwarded
-using whichever of two methods suits its content best, then reassembled on the
-client into a single desktop.
+this explains how XSV is designed to work, the mechanism, not just the
+decisions behind it. if you just want to build and run what currently
+exists, see [`README.md`](README.md) instead.
 
-- **instructions method** — drawing primitives forwarded over a reliable channel,
-  rendered natively on the client. cheap, sharp, low bandwidth. good for normal
-  2D UI (browsers minus video, terminals, editors, file managers).
-- **video method** — the region is captured and encoded as video, streamed over
-  an unreliable/low-latency channel. good for 3D/GL content and actual video
-  playback, where "instructions" don't apply or aren't worth reconstructing.
+## the idea, in one example
 
-the two methods run **side by side, per window, and even per-region within a
-window** — e.g. a YouTube tab in Firefox: the video element streams as video,
-the rest of the browser chrome and page stays on the instructions path.
-switching between them happens dynamically as content changes.
+say you're remoting into a linux desktop and you open Firefox to watch a
+YouTube video. most of that screen (the tabs, the toolbar, the page around
+the video, the scrollbar) is ordinary 2D UI that barely changes from one
+frame to the next. the video itself is the opposite: constantly changing,
+usually 3D/GPU-composited by the time it hits the screen.
 
-only-update-on-damage (not a fixed 60fps poll) applies to the instructions path.
-video path runs its own natural frame cadence.
+XSV treats these differently, in the same window, at the same time:
 
-status: design doc, no code yet beyond the capture proof-of-concept in
-`server/capture/`.
+- the page chrome gets forwarded as **drawing instructions**, things like
+  "draw this rectangle here" or "draw this text here", which the client
+  reconstructs natively. cheap, sharp, and only sent when something
+  actually changes.
+- the video region gets **encoded and streamed as video**, because trying
+  to describe a video frame as a list of shapes is pointless. you'd rather
+  just send the frame.
 
----
+which method applies isn't fixed per app or per window. it's decided
+continuously, per region, and can flip live as content changes (scroll a
+static page and it's instructions, a video starts playing in one corner
+and that corner switches to video while the rest of the page stays put).
 
-## 1. prior art (read before building anything)
+## the pieces
 
-this idea is not starting from zero. closest existing projects, roughly in
+### server side
+
+**capture layer**, watches actual windows on the real X11 display and
+knows two things: which pixels changed, and what those pixels actually
+are. built on two X11 extensions plus MIT-SHM for actually reading the
+pixel data:
+
+- `XComposite` redirects a window's rendering into an off-screen buffer we
+  can read, without taking over responsibility for painting it to the
+  screen ourselves (see "known gotchas" below for why that distinction
+  matters).
+- `XDamage` tells us, as events, exactly which rectangular regions of a
+  window changed and when. this is what lets XSV update only when the
+  screen actually changes, instead of polling 60 times a second regardless
+  of whether anything moved.
+- once we know something changed, `XCompositeNameWindowPixmap` gets us a
+  handle to the window's current backing pixmap, and MIT-SHM (`XShmGetImage`)
+  reads the actual pixel bytes out of it fast, since capture happens on
+  the same machine as the X server and there's no reason to ship pixels
+  through the X protocol's normal wire format to get them. falls back to
+  plain `XGetImage` if shared memory isn't available.
+
+**status: working.** the capture proof-of-concept in `server/capture/`
+proves this end to end. it watches a real window, correctly reports damage
+rectangles as things change on screen, and pulls the actual pixel content
+out on every change (currently just written out as a PPM image file for
+verification, nothing is transmitted anywhere yet).
+
+**classification engine** *(not yet built)*, decides, per window and
+eventually per sub-region, whether instructions or video is the better fit
+right now. the rough logic: a surface backed by direct GL/EGL/Vulkan
+rendering defaults to video, a region with damage events arriving faster
+than some threshold (continuous motion, not just occasional redraws)
+switches to video, and everything else stays on instructions. needs
+hysteresis so it doesn't flip back and forth on borderline cases, a brief
+scroll shouldn't trigger a codec switch, ten continuous seconds of motion
+should.
+
+**encode/serialize layer** *(not yet built)*, turns the classified content
+into bytes to send. the instructions path needs a wire format for drawing
+primitives (rectangle, text run, image blit, clip, protobuf is a
+reasonable starting point). the video path hands the region off to
+hardware video encoding (GStreamer with VAAPI on linux) and packetizes the
+result.
+
+**asset cache** *(not yet built)*, fonts, glyph atlases, and background
+images get sent once, by content hash. if the client already has that hash
+cached, the server only sends a reference to it, not the bytes again.
+
+### client side
+
+**instruction renderer** *(not yet built)*, interprets the instruction
+stream and draws it natively. planned to be built on **Skia** (the same 2D
+graphics library behind Chrome, Android, and Flutter) rather than
+hand-rolling a separate native drawing backend per target platform: one
+Skia backend per platform instead of five different rendering stacks.
+
+**video decoder/overlay** *(not yet built)*, decodes the incoming video
+stream using whatever hardware decode API the platform offers, and
+composites the result into the exact screen rect the server says that
+region occupies.
+
+**compositor** *(not yet built)*, the thin layer that stacks the
+vector-rendered rects and the video rects together into one coherent
+screen.
+
+## why build it this way (prior art)
+
+none of this is starting from zero. closest existing projects, in rough
 order of relevance:
 
-- **Xpra** — already does per-window capture with automatic encoding choice
-  (lossless-ish vs. video codec) based on window content and change frequency.
-  closest existing analog to the whole "decide per window" idea. supports
-  X11/macOS/Windows server side, has an HTML5 client, and already supports
-  QUIC as a transport. worth reading its encoding-selection logic before
-  designing ours from scratch.
-- **NX / X2Go (`nx-libs`)** — true X11 protocol-level proxying with caching of
-  pixmaps, fonts, glyphs, and round-trip reduction. this is the closest thing
-  to our "instructions" method and to the "cache constants like fonts/bg
-  images" requirement — it's already solved there, at the protocol level.
-- **Waypipe** — the wayland equivalent of the above. proxies the wayland
-  protocol itself, diffs shared-memory buffer damage, and already has a mode
-  that swaps a per-surface video encode in for GPU-backed buffers. also
-  documents a real gotcha: switching encoders per-buffer causes visible
-  flicker as buffers rotate. relevant the moment we start on wayland support.
-- **Moonlight/Sunshine, Parsec** — reference implementations for the video
-  half specifically: hardware encode, low-latency RTP-over-UDP, adaptive
-  bitrate. good study material independent of the windowing problem.
+- **Xpra** already does per-window capture with automatic encoding choice
+  between lossless-ish and video codecs, based on window content and
+  change frequency. the closest existing analog to XSV's whole "decide per
+  window" idea, worth reading before building the classification engine.
+- **NX / X2Go (`nx-libs`)** does true X11 protocol-level proxying with
+  caching of pixmaps, fonts, and glyphs. the closest existing analog to
+  XSV's instructions method and asset cache.
+- **Waypipe** is the Wayland equivalent: proxies the Wayland protocol,
+  diffs shared-memory buffer damage, and already has a mode that swaps in
+  a per-surface video encode for GPU-backed buffers. relevant reading the
+  moment XSV gets to Wayland support, including a documented gotcha about
+  visible flicker when the encoder switches per-buffer.
+- **Moonlight/Sunshine, Parsec** are reference implementations for the
+  video half specifically: hardware encode, low-latency RTP-over-UDP,
+  adaptive bitrate.
 
-practical read on scope: XSV = Xpra's per-surface hybrid decision engine +
-Waypipe's proxying model (for wayland, later) + a from-scratch cross-platform
-client renderer aimed specifically at clean sub-region switching (the
-YouTube-in-Firefox case) and genuinely broad client support (linux, android,
-and later ios/windows/macos).
+## transport (not yet decided)
 
----
+the obvious first cut is TCP for instructions (reliable, ordered) and UDP
+for video (fast, tolerates loss). two more deliberate options worth
+committing to before writing networking code:
 
-## 2. server side
+- **QUIC**, multiple independent streams over one UDP socket, each
+  individually reliable-ordered or using the unreliable datagram extension
+  (RFC 9221), built-in TLS 1.3, no head-of-line blocking between channels
+  the way two separate transports would have. Xpra already ships QUIC
+  support.
+- **WebRTC**, data channels for instructions, media tracks for video. buys
+  NAT traversal, congestion control, and encryption for free, and already
+  has native SDKs on every platform in the platform roadmap below, ios
+  included.
 
-### 2.1 capture/hook layer (X11 first)
+## platform roadmap
 
-- `XComposite` — redirect each window to an off-screen pixmap so we can read
-  its contents independent of what's on screen.
-- `XDamage` — per-window (and ideally per-region) damage events. this is the
-  mechanism behind "only update when the screen updates."
-- `XShape` — non-rectangular windows, lower priority, cosmetic.
-- for the instructions path itself: not reinventing IPC, running something
-  like an X11 protocol proxy (nx-libs style) between the app and a virtual X
-  server, extracting draw primitives instead of just diffing pixels.
+- **linux/X11**: primary target, in progress.
+- **wayland**: no equivalent of X11's protocol-forwarding trick exists.
+  follow Waypipe's model (proxy the protocol, diff SHM buffer damage,
+  video-encode DMA-BUF surfaces) rather than inventing this fresh.
+- **android client**: same shape as the linux client once the client-core
+  renderer exists, since it was never running X11 either way.
+- **ios client**: same reasoning as android, needs the Skia instruction
+  renderer plus platform video decode (VideoToolbox), nothing X11-specific.
+- **windows/macos as a server**: a genuinely different problem from X11.
+  there's no equivalent "forward the protocol, get vector instructions"
+  trick for GDI/DirectX or Core Graphics/Metal. realistic scope there is
+  always-video-per-window (the way Parsec/Moonlight/Xpra's own
+  windows-shadow mode work), unless a much harder, separate effort using
+  platform accessibility trees (UI Automation / macOS Accessibility API)
+  gets built to reconstruct semantic UI instead.
 
-### 2.2 classification/decision engine
+## implementation status
 
-the actual novel part of this project. per window, and ideally per sub-region:
+**done:**
+- X11 damage detection (`server/capture/`), proves a real window's changes
+  get reported correctly and promptly.
+- pixel capture (`server/capture/src/capture.c`), proves actual pixel data
+  can be pulled out of a redirected window, using MIT-SHM with a plain
+  `XGetImage` fallback.
 
-- GL/EGL/Vulkan direct-rendering context on a surface → video, by default.
-- damage-event frequency above a threshold in a sub-rect (e.g. 20+
-  updates/sec confined to one region while the rest of the window is static)
-  → that region flips to video, everything else stays on instructions. this
-  is the YouTube-tab case and needs sub-window granularity, or the whole
-  browser chrome gets dragged into video mode along with the tab content.
-- hysteresis required — a window mid-scroll for 300ms isn't worth a codec
-  switch, ten seconds of continuous motion is. flapping mode every frame
-  would look and perform worse than picking either method and sticking with
-  it.
+**known gotchas already hit and fixed, worth knowing about if you're
+reading the capture code:**
+- redirecting with `CompositeRedirectManual` instead of `Automatic` will
+  silently stop damage notifications from arriving at all. manual mode
+  hands you full compositing-manager repaint duties, which this tool
+  doesn't perform.
+- an event loop that gates draining `XPending()` behind `select()`'s
+  return value can silently drop events. Xlib can already have events
+  buffered internally as a side effect of an unrelated earlier synchronous
+  call (e.g. `XGetWindowAttributes`), and those never show up as fresh
+  socket readability. always drain `XPending()` unconditionally first, use
+  `select()` only to sleep efficiently in between.
+- MIT-SHM can advertise support via `XShmQueryExtension` and then still
+  fail the actual attach on restrictive setups (containers especially).
+  worth checking for that failure explicitly rather than assuming the
+  extension being present means it'll work, and falling back cleanly to
+  `XGetImage` when it doesn't.
 
-### 2.3 encode/serialize
+**not yet built, roughly in the order it makes sense to tackle them:**
 
-- instructions path: pick a wire format now even if crude — protobuf is
-  fine to start. draw-rect, draw-glyph-run(font-ref, string, position),
-  blit-image(cache-key), clip, etc.
-- video path: GStreamer — VAAPI hardware encode on linux, RTP payloading,
-  and it already has the cross-platform decode elements we'll want on the
-  client side later.
-
-### 2.4 asset cache
-
-content-addressed: hash fonts/glyph atlases/background images, server sends
-the hash first, only pushes bytes on a cache miss. same trick rsync and NX
-already use. server keeps a per-session table of what a given client already
-has cached.
-
----
-
-## 3. client side
-
-two renderers running in parallel, composited together into one screen:
-
-- **instruction interpreter/renderer** — needs a drawing backend. don't
-  hand-roll platform-native drawing per OS, that's reimplementing text
-  shaping and rasterization five times over. **Skia** is the pragmatic
-  choice — it already runs on linux, android, ios, windows, and macos (it's
-  what chrome/android/flutter use). the "instructions" wire format is
-  basically a thin serialization of Skia canvas calls, and each platform's
-  client is a thin Skia backend rather than a bespoke renderer.
-- **video decode/overlay** — hardware decode per platform (VA-API/VDPAU on
-  linux, MediaCodec on android, VideoToolbox on ios/macos, Media Foundation
-  on windows), decoded frame composited into the exact screen rect the
-  server says that window/region occupies.
-- a lightweight client-side compositor that just knows "these rects are
-  vector-rendered, these rects are video frames, stack them in z-order."
-
----
-
-## 4. transport
-
-TCP-for-instructions / UDP-for-video is the obvious first cut, but before
-committing to raw sockets:
-
-- **QUIC** is worth taking seriously — multiple independent streams over one
-  UDP socket, per-stream choice of reliable-ordered (instructions channel)
-  vs. the unreliable datagram extension (RFC 9221, video channel), built-in
-  TLS 1.3, much better behavior on flaky/mobile networks than bolting two
-  separate transports together (no cross-channel head-of-line blocking).
-  Xpra already ships QUIC support, which is a good sign it's viable here.
-- **WebRTC** is the other real option — data channels for instructions,
-  media tracks for video. buys NAT traversal (ICE/STUN/TURN), congestion
-  control, and encryption for free, and has native SDKs on every target
-  platform we care about, ios included. matters a lot for the "maybe
-  ios/windows/macos later" goal.
-
-decide between these before writing networking code — they imply different
-library dependencies and different degrees of "built for us" vs. "off the
-shelf."
-
----
-
-## 5. platform scope notes (read before promising features)
-
-- **wayland**: no core protocol-forwarding concept the way X11 has. follow
-  Waypipe's model when we get here (proxy the protocol, diff SHM buffer
-  damage, video-encode DMA-BUF surfaces) — don't invent this fresh.
-- **windows/macos as a server**: fundamentally different problem from X11.
-  no equivalent "forward the protocol, get vector instructions" trick exists
-  — GDI/DirectX and Core Graphics/Metal don't expose anything analogous.
-  realistic scope: always-video-per-window there (à la Parsec/Moonlight/
-  Xpra's own windows-shadow mode), unless we go down a much harder,
-  separate R&D track using platform accessibility trees (UI Automation /
-  macOS Accessibility API) to reconstruct semantic UI. decide explicitly
-  when we get there whether "windows/macos server" means full parity
-  (hard) or video-only there (easy, and a reasonable scope line).
-- **ios as a client**: comparatively easy in this architecture. it was never
-  going to run X11 anyway — just needs the Skia instruction renderer +
-  VideoToolbox decode, same shape as any other client.
-
----
-
-## 6. build order
-
-1. single-window video-only streaming, linux→linux, over UDP/RTP. proves the
-   transport and decode path with nothing else in the way.
-2. X11 instruction path for one simple window type (e.g. a terminal), over
-   TCP, no caching yet. proves the vector round-trip and Skia rendering.
-3. per-window classification, whole-window granularity only (no sub-regions
-   yet).
+1. single-window video-only streaming, linux to linux, over UDP/RTP. now
+   that real pixel data can be pulled out of a window, this is the next
+   real milestone: hand those pixels to an encoder, stream them over the
+   network, decode and display them somewhere else.
+2. X11 instructions path for one simple window type (e.g. a terminal),
+   over TCP, no caching yet. proves the vector round-trip and Skia
+   rendering.
+3. per-window classification, whole-window granularity only.
 4. font/image caching.
-5. sub-region splitting (the firefox/youtube case). hardest step, do it
-   last, once everything above is solid.
+5. sub-region splitting (the firefox/youtube case), the hardest step,
+   deliberately last, once everything above is solid.
 6. android client.
-7. wayland server support, via the waypipe model.
+7. wayland server support, via the Waypipe model.
 8. ios client, then scope out windows/macos server support properly.
-
-current status: step 0 — proving `XComposite`/`XDamage` capture works at all
-on a single window, before any of the above. see `server/capture/`.
-
----
-
-## 7. repo layout
-
-```
-xsv/
-  LICENSE              GPLv3, verbatim
-  ARCHITECTURE.md       this file
-  server/
-    capture/            XComposite/XDamage capture layer (X11 first)
-    classify/           per-window/per-region instructions-vs-video decision engine
-    encode/             instruction serializer + gstreamer video encode pipeline
-    transport/          wire protocol, QUIC or WebRTC transport layer
-  client-core/          shared skia-based instruction renderer + video overlay compositor
-  clients/
-    linux/              linux client shell
-    android/             android client shell
-  docs/                 anything longer-form than fits in this file
-```
