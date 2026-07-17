@@ -1,0 +1,8 @@
+# build artifacts
+server/capture/xsv-capture-poc
+*.o
+
+# editor/OS noise
+.vscode/
+*.swp
+.DS_Store
