@@ -13,6 +13,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <signal.h>
 #include <sys/select.h>
 #include <X11/Xlib.h>
@@ -32,15 +33,24 @@ static void handle_sigint(int sig) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <window-id-in-hex>\n", argv[0]);
+    if (argc < 2 || argc > 3 || (argc == 3 && strcmp(argv[2], "--stream") != 0)) {
+        fprintf(stderr, "usage: %s <window-id-in-hex> [--stream]\n", argv[0]);
+        fprintf(stderr, "  without --stream: logs damage events, saves latest.ppm on each one\n");
+        fprintf(stderr, "  with --stream: writes raw rgb24 frames to stdout, for piping into\n");
+        fprintf(stderr, "                 something like gstreamer's rawvideoparse. all the\n");
+        fprintf(stderr, "                 normal logging moves to stderr in this mode so it\n");
+        fprintf(stderr, "                 doesn't end up inside the binary stream.\n");
         return 1;
     }
+    int stream_mode = (argc == 3);
 
     /* redirected to a file when we background this thing, which means
        fully-buffered stdio by default, so we line-buffer it so the log is
-       actually readable while it's still running, not just after exit. */
-    setvbuf(stdout, NULL, _IOLBF, 0);
+       actually readable while it's still running, not just after exit.
+       this is stderr, not stdout, stdout is reserved for the raw frame
+       bytes when --stream is on, and there's no reason to treat it
+       differently when it's just carrying log lines either. */
+    setvbuf(stderr, NULL, _IOLBF, 0);
 
     Window target = (Window)strtoul(argv[1], NULL, 16);
 
@@ -87,10 +97,18 @@ int main(int argc, char **argv) {
 
     XWindowAttributes attrs;
     if (XGetWindowAttributes(dpy, target, &attrs)) {
-        printf("watching window 0x%lx (%dx%d) for damage, ctrl-c to stop\n",
-               target, attrs.width, attrs.height);
+        fprintf(stderr, "watching window 0x%lx (%dx%d) for damage, ctrl-c to stop\n",
+                target, attrs.width, attrs.height);
     } else {
-        printf("watching window 0x%lx for damage, ctrl-c to stop\n", target);
+        fprintf(stderr, "watching window 0x%lx for damage, ctrl-c to stop\n", target);
+    }
+
+    if (stream_mode) {
+        /* whatever's on the other end of the pipe needs to know these
+           up front, since a raw rgb stream carries no header of its own.
+           printed to stderr, not stdout, same reason as everything else. */
+        fprintf(stderr, "stream format: rgb24, %dx%d, no fixed framerate (damage-driven)\n",
+                attrs.width, attrs.height);
     }
 
     signal(SIGINT, handle_sigint);
@@ -115,11 +133,11 @@ int main(int argc, char **argv) {
             if (ev.type == dmg_event_base + XDamageNotify) {
                 XDamageNotifyEvent *de = (XDamageNotifyEvent *)&ev;
                 damage_count++;
-                printf("damage #%ld: rect (%d,%d %dx%d) more=%d\n",
-                       damage_count,
-                       de->area.x, de->area.y,
-                       de->area.width, de->area.height,
-                       de->more);
+                fprintf(stderr, "damage #%ld: rect (%d,%d %dx%d) more=%d\n",
+                        damage_count,
+                        de->area.x, de->area.y,
+                        de->area.width, de->area.height,
+                        de->more);
 
                 /* ack it or the server stops sending new ones for this
                    damage object. XDamageSubtract with None,None just
@@ -129,11 +147,22 @@ int main(int argc, char **argv) {
 
                 /* this is the actual point of adding capture.c: pull the
                    real pixels out, not just the notification that they
-                   changed. overwrites the same file each time so you can
-                   just keep opening it and see the current contents. */
+                   changed. */
                 xsv_frame frame;
                 if (xsv_capture_window(dpy, target, &frame) == 0) {
-                    xsv_save_ppm(&frame, "latest.ppm");
+                    if (stream_mode) {
+                        /* raw bytes straight to stdout, no header, no
+                           framing, whatever's downstream (gstreamer's
+                           rawvideoparse in our case) already knows the
+                           dimensions from the message printed above. */
+                        size_t n = (size_t)frame.width * frame.height * 3;
+                        fwrite(frame.rgb, 1, n, stdout);
+                        fflush(stdout);
+                    } else {
+                        /* overwrites the same file each time so you can
+                           just keep opening it and see current contents. */
+                        xsv_save_ppm(&frame, "latest.ppm");
+                    }
                     xsv_free_frame(&frame);
                 } else {
                     fprintf(stderr, "capture failed on damage #%ld\n", damage_count);
@@ -152,7 +181,7 @@ int main(int argc, char **argv) {
         select(fd + 1, &fds, NULL, NULL, &tv);
     }
 
-    printf("\ncaught %ld damage events, shutting down cleanly\n", damage_count);
+    fprintf(stderr, "\ncaught %ld damage events, shutting down cleanly\n", damage_count);
     XDamageDestroy(dpy, damage);
     XCompositeUnredirectWindow(dpy, target, CompositeRedirectAutomatic);
     XCloseDisplay(dpy);

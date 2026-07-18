@@ -9,19 +9,28 @@ for an explanation of how the whole thing is designed to work, see
 [`ARCHITECTURE.md`](ARCHITECTURE.md). this file is just "how do i build and
 run what currently exists."
 
+# PLEASE NOTE
+
+This markdown document was partially written with AI. (to save time btw)
+
+yes, I (the human) wrote this part.
+
 ## current status
 
-pre-alpha. what actually runs right now is a capture proof-of-concept that:
+pre-alpha. what actually runs right now:
 
-1. watches a real X11 window and reports when and where its contents
-   change, using `XComposite`/`XDamage`
-2. pulls the actual pixel data out of that window on every change, using
-   MIT-SHM (falling back to plain `XGetImage` if shared memory isn't
-   available), and saves it as a PPM image file
+1. the capture poc watches a real X11 window and reports when and where
+   its contents change, using `XComposite`/`XDamage`, then pulls the
+   actual pixel data out on every change using MIT-SHM (falling back to
+   plain `XGetImage` if shared memory isn't available)
+2. that pixel data can be piped into GStreamer to prove the video path:
+   real content, encoded as h264, sent over actual RTP/UDP, and decoded
+   on the other end. currently glued together with shell scripts calling
+   gstreamer's command line tools, not dedicated server/client code
 
-there's no networking, no encoding, no client, and nothing that streams
-anywhere yet. see the "implementation status" section of `ARCHITECTURE.md`
-for what's next.
+no real server/client programs yet, no instructions path, no
+classification, nothing that renegotiates on window resize. see the
+"implementation status" section of `ARCHITECTURE.md` for what's next.
 
 ## requirements
 
@@ -38,9 +47,13 @@ sudo apt-get install build-essential libx11-dev libxcomposite-dev libxdamage-dev
 optional, only needed if you want to test without a real desktop session
 (e.g. in a headless container): `xvfb xterm x11-utils`.
 
-optional, only needed if you want to actually look at the captured frames:
-`imagemagick` (to convert the output PPM to something more viewable, like
-PNG).
+optional, only needed if you want to actually look at captured frames:
+`imagemagick` (to convert the capture poc's PPM output to something more
+viewable, like PNG).
+
+optional, only needed for the network streaming proof below:
+`gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly`
+(the `ugly` set is where the h264 encoder lives).
 
 ## building
 
@@ -52,7 +65,7 @@ make
 produces `./xsv-capture-poc` in that same directory. it isn't installed
 anywhere, just run it from there.
 
-## running it
+## running the capture poc
 
 1. find the window id of something you want to watch:
 
@@ -97,6 +110,39 @@ anywhere, just run it from there.
 5. `ctrl-c` to stop. it prints a final count of how many damage events it
    caught before shutting down cleanly.
 
+## streaming a window over the network (video path proof)
+
+this is the current step 1 proof: real window content, captured, encoded
+as h264, sent over actual RTP/UDP, and decoded on the other end. it's
+glued together with GStreamer's command line tools rather than dedicated
+code, since that's enough to prove the mechanism works before writing a
+real server/client program around it.
+
+1. build the capture poc as above, and make sure the gstreamer packages
+   listed under "requirements" are installed.
+2. find your target window's id and dimensions with `xwininfo` (dimensions
+   are fixed for the whole session right now, nothing renegotiates on
+   resize yet).
+3. on the receiving machine (or just a second terminal, for a loopback
+   test), start:
+
+   ```
+   server/transport/gst-receiver.sh <port> <output-dir>
+   ```
+
+   it decodes incoming frames and drops them in `<output-dir>` as jpegs.
+   since there's no real client display code yet, this is just for
+   checking by eye that content actually arrived.
+
+4. on the sending machine, start:
+
+   ```
+   server/transport/gst-sender.sh <window-id-hex> <width> <height> <dest-host> <port>
+   ```
+
+5. interact with the window you pointed it at. jpegs should start showing
+   up in the receiver's output directory as you do.
+
 ## troubleshooting
 
 - **`no xcomposite/xdamage/xfixes extension on this display`**: your X
@@ -118,6 +164,10 @@ anywhere, just run it from there.
 - **built fine but `./xsv-capture-poc: command not found`**: you're
   probably not in `server/capture/`. it's not installed system-wide, run
   it as `./xsv-capture-poc`, not `xsv-capture-poc`.
+- **the streaming scripts produce no jpegs at all**: check `DISPLAY` is
+  actually set and exported in the shell running `gst-sender.sh`, since it
+  calls the capture poc internally and will fail silently into an empty
+  stream otherwise.
 
 ## license
 

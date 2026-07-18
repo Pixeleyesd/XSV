@@ -4,6 +4,12 @@ this explains how XSV is designed to work, the mechanism, not just the
 decisions behind it. if you just want to build and run what currently
 exists, see [`README.md`](README.md) instead.
 
+# PLEASE NOTE
+
+This markdown document was partially written with AI. (to save time btw)
+
+yes, I (the human) wrote this part.
+
 ## the idea, in one example
 
 say you're remoting into a linux desktop and you open Firefox to watch a
@@ -158,6 +164,15 @@ committing to before writing networking code:
 - pixel capture (`server/capture/src/capture.c`), proves actual pixel data
   can be pulled out of a redirected window, using MIT-SHM with a plain
   `XGetImage` fallback.
+- single-window video streaming, linux to linux, proven locally over real
+  RTP/UDP. the capture tool's `--stream` mode writes raw RGB24 frames to
+  stdout on every damage event, piped straight into a GStreamer pipeline
+  (`x264enc` for encoding, `rtph264pay`/`udpsink` for transport) and back
+  out the other side (`udpsrc`/`rtph264depay`, `avdec_h264` for decoding).
+  this is currently glued together with a `gst-launch-1.0` shell pipeline
+  rather than dedicated code, and only tested over loopback with fixed,
+  hardcoded dimensions, no proper client display yet, and no real
+  server/client program structure. proves the mechanism, not the product.
 
 **known gotchas already hit and fixed, worth knowing about if you're
 reading the capture code:**
@@ -179,10 +194,10 @@ reading the capture code:**
 
 **not yet built, roughly in the order it makes sense to tackle them:**
 
-1. single-window video-only streaming, linux to linux, over UDP/RTP. now
-   that real pixel data can be pulled out of a window, this is the next
-   real milestone: hand those pixels to an encoder, stream them over the
-   network, decode and display them somewhere else.
+1. turn the loopback shell-pipeline proof into an actual server program and
+   client program, over a real network connection instead of localhost,
+   with the window's actual dimensions instead of hardcoded ones, and a
+   real display on the receiving end instead of jpeg files.
 2. X11 instructions path for one simple window type (e.g. a terminal),
    over TCP, no caching yet. proves the vector round-trip and Skia
    rendering.
