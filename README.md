@@ -5,7 +5,6 @@ forwarded using whichever method suits its content: vector drawing
 instructions for normal UI, video encoding for 3D/GL content and actual
 video playback. everything gets reassembled into one desktop on the client.
 
-for an explanation of how the whole thing is designed to work, see
 [`ARCHITECTURE.md`](ARCHITECTURE.md). this file is just "how do i build and
 run what currently exists."
 
