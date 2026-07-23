@@ -5,6 +5,7 @@ forwarded using whichever method suits its content: vector drawing
 instructions for normal UI, video encoding for 3D/GL content and actual
 video playback. everything gets reassembled into one desktop on the client.
 
+for an explanation of how the whole thing is designed to work, see
 [`ARCHITECTURE.md`](ARCHITECTURE.md). this file is just "how do i build and
 run what currently exists."
 
@@ -109,7 +110,63 @@ anywhere, just run it from there.
 5. `ctrl-c` to stop. it prints a final count of how many damage events it
    caught before shutting down cleanly.
 
-## streaming a window over the network (video path proof)
+## the real server and client programs
+
+`server/transport/xsv_server.c` is the actual server program, using the
+GStreamer C API directly (not shelling out to `gst-launch-1.0` like the
+proof below). it enumerates every real window on the desktop and streams
+each one independently, each with its own capture, encode pipeline, and
+udp port, telling the client exactly where every one belongs via a small
+TCP handshake. this is the real multi-window "shards" mechanism, not a
+single-window stand-in for it.
+
+**current status**: the first window streamed reliably decodes and
+displays correctly, confirmed with real captured content, not just a
+synthetic test pattern. additional windows streamed at the same time
+have an unresolved issue and don't currently render. see the
+"implementation status" section of `ARCHITECTURE.md` for exactly what's
+confirmed working, what's been ruled out, and what to try next.
+
+`xsv_client.c` is a CLI prototype that predates the multi-window protocol
+above, it still only speaks the original single-window handshake format
+and will need updating to read the new count-plus-per-window handshake
+before it can display more than one shard. it's kept here since it's
+still useful for single-window testing in the meantime, and will be
+superseded by a proper client application (the next piece of this
+project) rather than patched further as a CLI tool.
+
+additional requirement: `libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`
+plus the same gstreamer runtime packages listed above (`gstreamer1.0-tools`
+etc.), plus `gstreamer1.0-x` specifically for `ximagesink`.
+
+```
+cd server/transport
+make
+```
+
+produces `xsv-server` and `xsv-client`.
+
+on the machine with the windows you want to share:
+```
+./xsv-server <control-port> <base-udp-port> [window-id-hex]
+```
+
+without the optional window id, it streams every real top-level window
+it can find. with one, it streams only that window (what `xsv_client.c`
+above still expects, and what the shell-pipeline proof below uses).
+
+the server blocks waiting for exactly one client to connect, sends the
+handshake(s), then starts streaming. each window gets its own udp port,
+counting up from `<base-udp-port>`.
+
+for single-window testing with the CLI client:
+```
+./xsv-client <server-host> <control-port>
+```
+the client creates an undecorated window at the exact position the
+handshake specifies and attempts to display the incoming video there.
+
+## streaming a window over the network (shell-pipeline proof)
 
 this is the current step 1 proof: real window content, captured, encoded
 as h264, sent over actual RTP/UDP, and decoded on the other end. it's

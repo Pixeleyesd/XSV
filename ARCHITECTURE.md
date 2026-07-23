@@ -164,18 +164,30 @@ committing to before writing networking code:
 - pixel capture (`server/capture/src/capture.c`), proves actual pixel data
   can be pulled out of a redirected window, using MIT-SHM with a plain
   `XGetImage` fallback.
-- single-window video streaming, linux to linux, proven locally over real
-  RTP/UDP. the capture tool's `--stream` mode writes raw RGB24 frames to
-  stdout on every damage event, piped straight into a GStreamer pipeline
-  (`x264enc` for encoding, `rtph264pay`/`udpsink` for transport) and back
-  out the other side (`udpsrc`/`rtph264depay`, `avdec_h264` for decoding).
-  this is currently glued together with a `gst-launch-1.0` shell pipeline
-  rather than dedicated code, and only tested over loopback with fixed,
-  hardcoded dimensions, no proper client display yet, and no real
-  server/client program structure. proves the mechanism, not the product.
+- a real multi-window server (`server/transport/xsv_server.c`): enumerates
+  every real window on the desktop (via `_NET_CLIENT_LIST` if a window
+  manager maintains one, falling back to walking the root window's
+  children otherwise), and streams every one of them independently, each
+  with its own capture, encode pipeline, and udp port. this is the actual
+  shards mechanism, confirmed with two real windows at once: the server
+  found both, assigned distinct ports, and independent damage routing was
+  verified directly, typing into one window only produced traffic on its
+  own port, confirmed with real byte counts on each.
+- a real client program (`xsv_client.c`) that reads the handshake and
+  creates a correctly positioned, undecorated window for each shard,
+  embedding decoded video into it via GStreamer's video overlay support.
+  proven correct with synthetic content early on, and now also confirmed
+  working with a real captured window: real xterm text, actually typed,
+  actually decoded and rendered pixel-for-pixel in the right screen
+  position on a separate display. this was the central open question
+  across the last two sessions, and it's now resolved for at least one
+  concrete real case, not just synthetic ones.
+- the multi-window handshake protocol (`protocol.h`): a count line
+  followed by one position/size/port line per window, extending cleanly
+  from the original single-window version.
 
 **known gotchas already hit and fixed, worth knowing about if you're
-reading the capture code:**
+reading the code:**
 - redirecting with `CompositeRedirectManual` instead of `Automatic` will
   silently stop damage notifications from arriving at all. manual mode
   hands you full compositing-manager repaint duties, which this tool
@@ -191,13 +203,52 @@ reading the capture code:**
   worth checking for that failure explicitly rather than assuming the
   extension being present means it'll work, and falling back cleanly to
   `XGetImage` when it doesn't.
+- appsrc's default internal queue limit (200KB) is smaller than a single
+  uncompressed frame at typical window sizes. without an explicit larger
+  `max-bytes`, `block=true` will stall `push_buffer` permanently after the
+  first frame or two, with no error, it just silently stops accepting more
+  data. set `max-bytes` explicitly, generously, well beyond one frame's
+  size.
+- `XGetWindowAttributes`' width/height exclude a window's border by spec,
+  but the composite pixmap actually captured from can include it, for
+  windows that draw their own border with no reparenting window manager
+  around them to strip it. fixed by doing one real capture at setup time
+  and trusting its actual dimensions as authoritative, rather than caching
+  attributes separately and hoping they agree.
+- h264's yuv420 encoding needs even width and height (chroma planes are
+  half resolution), so an odd window dimension needs cropping by one
+  row/column before encoding, not just accepting whatever size the window
+  happens to be.
+- raw video's default stride assumes rows are padded to a 4-byte boundary.
+  a tightly packed `width * 3` row only happens to already satisfy that
+  for some widths, not all of them (a coincidence that held for the very
+  first window sizes tested, and quietly stopped holding for others). a
+  mismatched stride here produced a hard-to-diagnose, generically-worded
+  "code not implemented" error from `videoconvert` that had nothing to do
+  with the actual missing feature the message implies.
+- a write to a socket the other end already closed raises `SIGPIPE`,
+  which by default kills the whole process instantly with no error
+  message printed anywhere, silently. `signal(SIGPIPE, SIG_IGN)` is
+  standard practice for anything network-facing and turns that into an
+  ordinary, checkable write failure instead.
+- **still unresolved**: with two real windows streaming at once, the
+  first one's video decodes and displays correctly, reliably, but the
+  second consistently doesn't, even in isolation (streaming only that
+  second window alone reproduces the same failure, which rules out
+  resource contention between multiple simultaneous encoder pipelines in
+  one process as the explanation). raw UDP delivery to that window's
+  port is confirmed working independent of gstreamer. a keyframe-interval
+  fix (forcing frequent IDR frames, in case a late-joining receiver was
+  simply missing the stream's only early keyframe) was tried and didn't
+  resolve it either. the cause hasn't been found yet. worth trying next:
+  swap which physical window is "first" vs "second" to check whether
+  this is really about stream order/position specifically, or something
+  about that particular window's content, since those haven't been
+  disentangled yet.
 
 **not yet built, roughly in the order it makes sense to tackle them:**
 
-1. turn the loopback shell-pipeline proof into an actual server program and
-   client program, over a real network connection instead of localhost,
-   with the window's actual dimensions instead of hardcoded ones, and a
-   real display on the receiving end instead of jpeg files.
+1. resolve the second-shard decode issue above.
 2. X11 instructions path for one simple window type (e.g. a terminal),
    over TCP, no caching yet. proves the vector round-trip and Skia
    rendering.
@@ -208,3 +259,4 @@ reading the capture code:**
 6. android client.
 7. wayland server support, via the Waypipe model.
 8. ios client, then scope out windows/macos server support properly.
+
